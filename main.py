@@ -1,9 +1,8 @@
-import asyncio
+﻿import asyncio
 import base64
 import json
 import mimetypes
 import re
-import socket
 import time
 from pathlib import Path
 from datetime import datetime
@@ -18,30 +17,22 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api.event import filter, AstrMessageEvent
 import astrbot.api.message_components as Comp
 
-# 固定环境配置
-CHROME_PATH = "/usr/bin/chromium-browser"
-ASTRBOT_ROOT = Path("/opt/AstrBot")
-DATA_DIR = ASTRBOT_ROOT / "data"
+try:
+    from .redact import is_sensitive_metadata, mask_sensitive, sanitize_filename
+    from .security import validate_url
+    from .settings import BrowserRuntimeConfig, build_runtime_config
+except Exception:
+    from redact import is_sensitive_metadata, mask_sensitive, sanitize_filename
+    from security import validate_url
+    from settings import BrowserRuntimeConfig, build_runtime_config
+
+# 默认路径仅作为配置缺省值；运行时可由 _conf_schema.json 覆盖。
+DATA_DIR = Path("/opt/AstrBot/data")
 TEMP_DIR = DATA_DIR / "temp"
-PROFILE_BASE_DIR = DATA_DIR / "browser_profiles"
-PROFILE_DIR = PROFILE_BASE_DIR / "default"
-
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
-PROFILE_DIR.mkdir(parents=True, exist_ok=True)
-
-SENSITIVE_RE = re.compile(
-    r"(?i)(access[_-]?token|refresh[_-]?token|id[_-]?token|authorization|cookie|password|passwd|secret|api[_-]?key|session)[\s:=\"']+([^\s\"'&;,}]+)"
-)
 
 
 def _mask_sensitive(value: Any, limit: int = 4000) -> str:
-    if value is None:
-        return ""
-    text = str(value)
-    text = SENSITIVE_RE.sub(lambda m: f"{m.group(1)}=<masked>", text)
-    if len(text) > limit:
-        text = text[:limit] + f"\n\n... 已截断（原长度 {len(text)}）"
-    return text
+    return mask_sensitive(value, limit)
 
 
 def _safe_json(obj: Any, limit: int = 8000) -> str:
@@ -67,38 +58,45 @@ class BrowserController:
         self.playwright = None
         self.context = None
         self.page = None
+        self.active_profile_key: Optional[str] = None
+        self.active_profile_dir: Optional[Path] = None
+        self.active_runtime: Optional[BrowserRuntimeConfig] = None
         self._init_lock = asyncio.Lock()
         self._op_lock = asyncio.Lock()
         self.dialog_behavior = "dismiss"  # dismiss / accept / ignore
         self.console_messages: list[str] = []
         self.request_failures: list[str] = []
 
-    async def ensure_page(self):
+    async def ensure_page(self, runtime: BrowserRuntimeConfig):
         async with self._init_lock:
             if self.playwright is None:
                 from playwright.async_api import async_playwright
                 self.playwright = await async_playwright().start()
 
+            if self.context is not None and self.active_profile_key != runtime.profile_key:
+                await self._close_context()
+
+            runtime.temp_dir.mkdir(parents=True, exist_ok=True)
+            runtime.profile_dir.mkdir(parents=True, exist_ok=True)
+
             if self.context is None:
                 launch_kwargs = dict(
-                    user_data_dir=str(PROFILE_DIR),
-                    headless=True,
-                    executable_path=CHROME_PATH,
+                    user_data_dir=str(runtime.profile_dir),
+                    headless=runtime.headless,
                     args=["--no-sandbox"],
-                    viewport={"width": 1280, "height": 800},
+                    viewport={"width": runtime.viewport_width, "height": runtime.viewport_height},
                     accept_downloads=True,
                 )
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(0.8)
-                    s.connect(("127.0.0.1", 7890))
-                    s.close()
-                    launch_kwargs["proxy"] = {"server": "http://127.0.0.1:7890"}
-                except Exception:
-                    pass
+                if runtime.chrome_path:
+                    launch_kwargs["executable_path"] = runtime.chrome_path
+                if runtime.use_proxy and runtime.proxy_server:
+                    launch_kwargs["proxy"] = {"server": runtime.proxy_server}
 
                 self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
-                self.context.on("page", lambda p: asyncio.create_task(self._prepare_page(p)))
+                self.context.on("page", lambda p: asyncio.create_task(self._prepare_page(p, runtime)))
+                self.active_profile_key = runtime.profile_key
+                self.active_profile_dir = runtime.profile_dir
+                self.active_runtime = runtime
 
             if self.page is not None:
                 try:
@@ -113,13 +111,13 @@ class BrowserController:
                 except Exception:
                     pages = []
                 self.page = pages[0] if pages else await self.context.new_page()
-                await self._prepare_page(self.page)
+                await self._prepare_page(self.page, runtime)
 
             return self.page
 
-    async def _prepare_page(self, page):
+    async def _prepare_page(self, page, runtime: BrowserRuntimeConfig):
         try:
-            page.set_default_timeout(15000)
+            page.set_default_timeout(runtime.default_timeout_ms)
             page.on("dialog", lambda dialog: asyncio.create_task(self._handle_dialog(dialog)))
             page.on("console", lambda msg: self._append_console(msg))
             page.on("requestfailed", lambda req: self._append_request_failed(req))
@@ -151,23 +149,42 @@ class BrowserController:
         except Exception:
             pass
 
-    async def error_screenshot(self, page, prefix: str = "browser_error") -> Optional[Path]:
+    def pages(self):
         try:
-            path = TEMP_DIR / f"{prefix}_{_now_stamp()}.png"
+            return [p for p in self.context.pages if not p.is_closed()] if self.context else []
+        except Exception:
+            return []
+
+    def set_page(self, page):
+        self.page = page
+
+    async def error_screenshot(self, page, prefix: str = "browser_error", temp_dir: Optional[Path] = None) -> Optional[Path]:
+        try:
+            temp_dir = temp_dir or TEMP_DIR
+            temp_dir.mkdir(parents=True, exist_ok=True)
+            path = temp_dir / f"{prefix}_{_now_stamp()}.png"
             await page.screenshot(path=str(path), full_page=True)
             return path
         except Exception:
             return None
 
+    async def _close_context(self):
+        if self.context:
+            try:
+                await self.context.close()
+            except Exception:
+                pass
+        self.context = None
+        self.page = None
+        self.active_profile_key = None
+        self.active_profile_dir = None
+        self.active_runtime = None
+        self.console_messages = []
+        self.request_failures = []
+
     async def close(self):
         async with self._init_lock:
-            if self.context:
-                try:
-                    await self.context.close()
-                except Exception:
-                    pass
-                self.context = None
-                self.page = None
+            await self._close_context()
             if self.playwright:
                 try:
                     await self.playwright.stop()
@@ -232,7 +249,23 @@ async def _click_like(page, selector: str) -> str:
     raise Exception("; ".join(errors))
 
 
-async def _fill_like(page, selector: str, text: str, clear: bool = True) -> str:
+async def _locator_sensitive(locator) -> bool:
+    try:
+        metadata = {
+            "type": await locator.get_attribute("type"),
+            "name": await locator.get_attribute("name"),
+            "id": await locator.get_attribute("id"),
+            "placeholder": await locator.get_attribute("placeholder"),
+            "aria": await locator.get_attribute("aria-label"),
+            "autocomplete": await locator.get_attribute("autocomplete"),
+        }
+        return is_sensitive_metadata(metadata)
+    except Exception:
+        # If we cannot inspect a field, prefer not to screenshot after typing.
+        return True
+
+
+async def _fill_like(page, selector: str, text: str, clear: bool = True) -> tuple[str, bool]:
     errors = []
     locators = [
         ("placeholder", lambda: page.get_by_placeholder(selector).first),
@@ -242,11 +275,12 @@ async def _fill_like(page, selector: str, text: str, clear: bool = True) -> str:
     for name, factory in locators:
         try:
             loc = factory()
+            sensitive = await _locator_sensitive(loc)
             if clear:
                 await loc.fill(text, timeout=5000)
             else:
                 await loc.type(text, timeout=5000)
-            return name
+            return name, sensitive
         except Exception as e:
             errors.append(f"{name}: {str(e)[:120]}")
     raise Exception("; ".join(errors))
@@ -260,6 +294,7 @@ class BrowserOperatorPlugin(Star):
         self.last_screenshot_path: Optional[str] = None
         self.last_observation: str = ""
         self.last_observe_at: float = 0.0
+        self.sensitive_profiles: set[str] = set()
 
     def _cfg(self, key: str, default=None):
         try:
@@ -267,10 +302,67 @@ class BrowserOperatorPlugin(Star):
         except Exception:
             return default
 
+    def _runtime(self, event: AstrMessageEvent) -> BrowserRuntimeConfig:
+        return build_runtime_config(self.config, event)
+
+    def _permission_error(self, event: AstrMessageEvent, runtime: Optional[BrowserRuntimeConfig] = None) -> str:
+        runtime = runtime or self._runtime(event)
+        try:
+            sender_id = str(event.get_sender_id())
+        except Exception:
+            sender_id = ""
+        try:
+            session_id = str(event.get_session_id())
+        except Exception:
+            session_id = ""
+
+        if runtime.allowed_users and sender_id not in runtime.allowed_users:
+            return "错误：当前用户无权限使用浏览器工具"
+        if runtime.allowed_sessions and session_id not in runtime.allowed_sessions:
+            return "错误：当前会话无权限使用浏览器工具"
+        return ""
+
+    async def _ensure_page(self, event: AstrMessageEvent):
+        runtime = self._runtime(event)
+        permission_error = self._permission_error(event, runtime)
+        if permission_error:
+            raise PermissionError(permission_error)
+        return await _browser_controller.ensure_page(runtime)
+
+    def _temp_dir(self, event: AstrMessageEvent) -> Path:
+        temp_dir = self._runtime(event).temp_dir
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        return temp_dir
+
+    def _profile_key(self, event: AstrMessageEvent) -> str:
+        return self._runtime(event).profile_key
+
+    def _mark_sensitive(self, event: AstrMessageEvent) -> None:
+        self.sensitive_profiles.add(self._profile_key(event))
+
+    def _clear_sensitive(self, event: AstrMessageEvent) -> None:
+        self.sensitive_profiles.discard(self._profile_key(event))
+
+    def _sensitive_block_message(self, event: AstrMessageEvent) -> str:
+        runtime = self._runtime(event)
+        if runtime.block_screenshots_in_sensitive_mode and runtime.profile_key in self.sensitive_profiles:
+            return "当前会话处于敏感输入保护模式，已跳过截图/视觉观察。打开新页面或刷新后会自动解除。"
+        return ""
+
+    async def _safe_error_screenshot(self, event: AstrMessageEvent, prefix: str) -> Optional[Path]:
+        try:
+            return await _browser_controller.error_screenshot(
+                await self._ensure_page(event),
+                prefix,
+                self._temp_dir(event),
+            )
+        except Exception:
+            return None
+
     def _vision_actions(self) -> set[str]:
         raw = self._cfg(
             "vision_trigger_actions",
-            "open,click,type,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,frame_type,viewport",
+            "open,click,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,viewport",
         )
         if isinstance(raw, list):
             return {str(x).strip() for x in raw if str(x).strip()}
@@ -283,16 +375,23 @@ class BrowserOperatorPlugin(Star):
             return False
         return action in self._vision_actions()
 
-    async def _capture_view(self, page, prefix: str = "browser_observe", full_page: Optional[bool] = None) -> Optional[Path]:
+    async def _capture_view(
+        self,
+        page,
+        prefix: str = "browser_observe",
+        full_page: Optional[bool] = None,
+        temp_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
         try:
-            TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            temp_dir = temp_dir or TEMP_DIR
+            temp_dir.mkdir(parents=True, exist_ok=True)
             if full_page is None:
                 full_page = bool(self._cfg("vision_full_page", False))
-            path = TEMP_DIR / f"{prefix}_{_now_stamp()}.png"
+            path = temp_dir / f"{prefix}_{_now_stamp()}.png"
             try:
                 await page.screenshot(path=str(path), full_page=bool(full_page))
             except Exception:
-                path = TEMP_DIR / f"{prefix}_viewport_{_now_stamp()}.png"
+                path = temp_dir / f"{prefix}_viewport_{_now_stamp()}.png"
                 await page.screenshot(path=str(path), full_page=False)
             self.last_screenshot_path = str(path)
             return path
@@ -334,6 +433,9 @@ class BrowserOperatorPlugin(Star):
     async def _observe_after_action(self, event: AstrMessageEvent, action: str, page=None) -> str:
         if not self._vision_enabled_for_action(action):
             return ""
+        sensitive_block = self._sensitive_block_message(event)
+        if sensitive_block:
+            return "\n\n[浏览器观察已跳过]\n" + sensitive_block
         try:
             min_interval = float(self._cfg("vision_min_interval_seconds", 0.5) or 0)
         except Exception:
@@ -344,7 +446,7 @@ class BrowserOperatorPlugin(Star):
         self.last_observe_at = now
         try:
             if page is None:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
             # 等待页面加载完成
             if bool(self._cfg("vision_wait_for_load", True)):
                 try:
@@ -353,7 +455,7 @@ class BrowserOperatorPlugin(Star):
                     await page.wait_for_timeout(500)
                 except Exception:
                     pass
-            shot = await self._capture_view(page, f"browser_observe_{action}")
+            shot = await self._capture_view(page, f"browser_observe_{action}", temp_dir=self._temp_dir(event))
             if not shot:
                 return "\n\n[浏览器观察]\n截图失败。"
             title = _mask_sensitive(await page.title(), 300)
@@ -386,8 +488,11 @@ class BrowserOperatorPlugin(Star):
         return message + await self._observe_after_action(event, action, page)
 
     async def _observe_now(self, event: AstrMessageEvent, action: str = "manual", full_page: Optional[bool] = None) -> str:
-        page = await _browser_controller.ensure_page()
-        shot = await self._capture_view(page, f"browser_observe_{action}", full_page=full_page)
+        sensitive_block = self._sensitive_block_message(event)
+        if sensitive_block:
+            return sensitive_block
+        page = await self._ensure_page(event)
+        shot = await self._capture_view(page, f"browser_observe_{action}", full_page=full_page, temp_dir=self._temp_dir(event))
         if not shot:
             return "截图失败"
         title = _mask_sensitive(await page.title(), 300)
@@ -431,18 +536,30 @@ class BrowserOperatorPlugin(Star):
         Args:
             url(string): 要打开的网页地址
         '''
-        if not isinstance(url, str) or not url.startswith(("http://", "https://")):
-            return "错误：只支持 http:// 和 https:// 开头的网址"
+        runtime = self._runtime(event)
+        permission_error = self._permission_error(event, runtime)
+        if permission_error:
+            return permission_error
+        try:
+            url = validate_url(
+                url,
+                allow_private_network=runtime.allow_private_network,
+                allowed_domains=runtime.allowed_domains,
+                blocked_domains=runtime.blocked_domains,
+            )
+        except Exception as e:
+            return f"错误：{_mask_sensitive(str(e), 500)}"
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.goto(url, timeout=60000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1500)
+                self._clear_sensitive(event)
                 msg = f"已打开网页\n标题：{_mask_sensitive(await page.title(), 300)}\nURL：{_mask_sensitive(page.url, 500)}\n\n[提醒] 页面未自动刷新；后续 click/type/scroll 都会继续操作当前页面。"
                 return await self._with_observation(event, "open", msg, page)
             except Exception as e:
                 try:
-                    shot = await _browser_controller.error_screenshot(await _browser_controller.ensure_page(), "open_error")
+                    shot = await self._safe_error_screenshot(event, "open_error")
                     return f"打开网页失败：{_mask_sensitive(str(e), 800)}\n错误截图：{shot}"
                 except Exception:
                     return f"打开网页失败：{_mask_sensitive(str(e), 800)}"
@@ -479,7 +596,7 @@ class BrowserOperatorPlugin(Star):
         max_chars = max(200, min(int(max_chars), 12000))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 text = await page.inner_text("body")
                 return _mask_sensitive(text, max_chars)
             except Exception as e:
@@ -495,7 +612,7 @@ class BrowserOperatorPlugin(Star):
         max_chars = max(500, min(int(max_chars), 20000))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 html = await page.content()
                 return _mask_sensitive(html, max_chars)
             except Exception as e:
@@ -506,8 +623,8 @@ class BrowserOperatorPlugin(Star):
         '''获取当前页面状态：标题、URL、正文预览、页面数量。不会刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
-                pages = [p for p in _browser_controller.context.pages if not p.is_closed()] if _browser_controller.context else []
+                page = await self._ensure_page(event)
+                pages = _browser_controller.pages()
                 preview = ""
                 try:
                     preview = await page.inner_text("body")
@@ -535,14 +652,13 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 method = await _click_like(page, selector)
                 await page.wait_for_timeout(1000)
                 msg = f"点击成功（定位方式：{method}）\n当前标题：{_mask_sensitive(await page.title(), 300)}\n当前URL：{_mask_sensitive(page.url, 500)}"
                 return await self._with_observation(event, "click", msg, page)
             except Exception as e:
-                page = await _browser_controller.ensure_page()
-                shot = await _browser_controller.error_screenshot(page, "click_error")
+                shot = await self._safe_error_screenshot(event, "click_error")
                 return f"点击失败：{_mask_sensitive(str(e), 1000)}\n错误截图：{shot}\n提示：可先用 browser_list_elements 或 browser_dump_near_text 排查选择器。"
 
     @filter.llm_tool(name="browser_click_role")
@@ -555,18 +671,18 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.get_by_role(role, name=name).click(timeout=10000)
                 await page.wait_for_timeout(1000)
                 msg = f"点击成功\n当前URL：{_mask_sensitive(page.url, 500)}"
                 return await self._with_observation(event, "click", msg, page)
             except Exception as e:
-                shot = await _browser_controller.error_screenshot(await _browser_controller.ensure_page(), "click_role_error")
+                shot = await self._safe_error_screenshot(event, "click_role_error")
                 return f"点击失败：{_mask_sensitive(str(e), 1000)}\n错误截图：{shot}"
 
     @filter.llm_tool(name="browser_type")
     async def browser_type(self, event: AstrMessageEvent, selector: str, text: str, clear: bool = True):
-        '''在当前页面输入框中输入文字。不会刷新页面。输入密码后也允许截图观察，是否截图由配置控制。
+        '''在当前页面输入框中输入文字。不会刷新页面。敏感字段输入后会跳过截图和自动观察。
 
         Args:
             selector(string): 输入框 CSS 选择器、label 或 placeholder 文本
@@ -575,12 +691,15 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
-                method = await _fill_like(page, selector, text, bool(clear))
+                page = await self._ensure_page(event)
+                method, sensitive = await _fill_like(page, selector, text, bool(clear))
                 msg = f"已输入文字（定位方式：{method}，长度 {len(text)}）"
+                if sensitive:
+                    self._mark_sensitive(event)
+                    return msg + "\n检测到敏感字段，已跳过截图和自动观察。"
                 return await self._with_observation(event, "type", msg, page)
             except Exception as e:
-                shot = await _browser_controller.error_screenshot(await _browser_controller.ensure_page(), "type_error")
+                shot = await self._safe_error_screenshot(event, "type_error")
                 return f"输入失败：{_mask_sensitive(str(e), 1000)}\n错误截图：{shot}"
 
     @filter.llm_tool(name="browser_press")
@@ -592,7 +711,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.keyboard.press(key)
                 await page.wait_for_timeout(700)
                 msg = f"已按键：{key}\n当前URL：{_mask_sensitive(page.url, 500)}"
@@ -610,7 +729,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 result = await page.locator(selector).first.select_option(value)
                 msg = f"已选择：{result}"
                 return await self._with_observation(event, "select", msg, page)
@@ -627,7 +746,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 try:
                     loc = page.get_by_label(selector).first
                     if checked:
@@ -652,14 +771,18 @@ class BrowserOperatorPlugin(Star):
         Args:
             full_page(boolean): 是否截取整个页面，默认true
         '''
+        sensitive_block = self._sensitive_block_message(event)
+        if sensitive_block:
+            return sensitive_block
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
-                path = TEMP_DIR / f"browser_screenshot_{_now_stamp()}.png"
+                page = await self._ensure_page(event)
+                temp_dir = self._temp_dir(event)
+                path = temp_dir / f"browser_screenshot_{_now_stamp()}.png"
                 try:
                     await page.screenshot(path=str(path), full_page=bool(full_page))
                 except Exception:
-                    path = TEMP_DIR / f"browser_viewport_{_now_stamp()}.png"
+                    path = temp_dir / f"browser_viewport_{_now_stamp()}.png"
                     await page.screenshot(path=str(path), full_page=False)
                 self.last_screenshot_path = str(path)
                 return f"截图已保存到：{path}"
@@ -670,7 +793,7 @@ class BrowserOperatorPlugin(Star):
     async def browser_url(self, event: AstrMessageEvent):
         '''获取当前页面 URL。不会刷新页面。'''
         try:
-            page = await _browser_controller.ensure_page()
+            page = await self._ensure_page(event)
             return f"当前URL：{_mask_sensitive(page.url, 500)}"
         except Exception as e:
             return f"获取URL失败：{_mask_sensitive(str(e), 800)}"
@@ -679,7 +802,7 @@ class BrowserOperatorPlugin(Star):
     async def browser_title(self, event: AstrMessageEvent):
         '''获取当前页面标题。不会刷新页面。'''
         try:
-            page = await _browser_controller.ensure_page()
+            page = await self._ensure_page(event)
             return f"当前标题：{_mask_sensitive(await page.title(), 300)}"
         except Exception as e:
             return f"获取标题失败：{_mask_sensitive(str(e), 800)}"
@@ -689,9 +812,10 @@ class BrowserOperatorPlugin(Star):
         '''刷新当前网页。只有用户明确要求刷新，或登录态验证需要刷新时才调用。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.reload(timeout=60000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1000)
+                self._clear_sensitive(event)
                 msg = f"已刷新网页\n标题：{_mask_sensitive(await page.title(), 300)}\nURL：{_mask_sensitive(page.url, 500)}"
                 return await self._with_observation(event, "reload", msg, page)
             except Exception as e:
@@ -702,9 +826,10 @@ class BrowserOperatorPlugin(Star):
         '''返回上一页。不会主动刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 res = await page.go_back(timeout=60000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1000)
+                self._clear_sensitive(event)
                 if res is None:
                     return "没有可返回的上一页"
                 msg = f"已返回上一页\n标题：{_mask_sensitive(await page.title(), 300)}\nURL：{_mask_sensitive(page.url, 500)}"
@@ -717,9 +842,10 @@ class BrowserOperatorPlugin(Star):
         '''前进到下一页。不会主动刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 res = await page.go_forward(timeout=60000, wait_until="domcontentloaded")
                 await page.wait_for_timeout(1000)
+                self._clear_sensitive(event)
                 if res is None:
                     return "没有可前进的下一页"
                 msg = f"已前进\n标题：{_mask_sensitive(await page.title(), 300)}\nURL：{_mask_sensitive(page.url, 500)}"
@@ -736,7 +862,7 @@ class BrowserOperatorPlugin(Star):
         '''
         seconds = max(1, min(int(seconds), 30))
         try:
-            page = await _browser_controller.ensure_page()
+            page = await self._ensure_page(event)
             await page.wait_for_timeout(seconds * 1000)
             return f"已等待 {seconds} 秒"
         except Exception as e:
@@ -753,7 +879,7 @@ class BrowserOperatorPlugin(Star):
         timeout_ms = max(1000, min(int(timeout_seconds), 30) * 1000)
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 try:
                     await page.get_by_text(selector, exact=True).wait_for(timeout=timeout_ms)
                     return f"元素已出现：{selector}"
@@ -772,7 +898,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 try:
                     await page.get_by_text(selector, exact=True).hover(timeout=5000)
                 except Exception:
@@ -794,7 +920,7 @@ class BrowserOperatorPlugin(Star):
         amount = max(1, min(int(amount), 5000))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 if direction == "top":
                     await page.evaluate("window.scrollTo(0, 0)")
                     msg = "已滚动到页面顶部"
@@ -823,7 +949,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 try:
                     element = page.get_by_text(selector, exact=True).first
                     await element.scroll_into_view_if_needed(timeout=5000)
@@ -845,7 +971,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 js_code = """(keyword) => {
                     const body = document.body.innerText || "";
                     const index = body.indexOf(keyword);
@@ -874,8 +1000,24 @@ class BrowserOperatorPlugin(Star):
         limit = max(1, min(int(limit), 100))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 js_code = """([kind, limit]) => {
+                    const sensitiveRe = /password|passwd|pwd|token|cookie|secret|api[_-]?key|authorization|auth|bearer|验证码|密码|令牌|密钥/i;
+                    const isSensitive = (el) => {
+                        const inputType = (el.getAttribute('type') || '').toLowerCase();
+                        const meta = [
+                            el.getAttribute('name'),
+                            el.id,
+                            el.getAttribute('placeholder'),
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('autocomplete')
+                        ].join(' ');
+                        return inputType === 'password' || sensitiveRe.test(meta);
+                    };
+                    const displayName = (el) => {
+                        if (isSensitive(el)) return '<sensitive input masked>';
+                        return (el.innerText || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 160);
+                    };
                     const selectors = {
                         buttons: 'button,[role="button"],input[type="button"],input[type="submit"]',
                         links: 'a[href]',
@@ -895,7 +1037,7 @@ class BrowserOperatorPlugin(Star):
                             id: el.id || null,
                             className: String(el.className || '').slice(0, 120),
                             role: el.getAttribute('role'),
-                            name: (el.innerText || el.value || el.placeholder || el.getAttribute('aria-label') || el.getAttribute('name') || '').slice(0, 160),
+                            name: displayName(el),
                             href: el.href ? el.href.slice(0, 200) : null,
                             rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}
                         }
@@ -916,7 +1058,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 js_code = """([x, y]) => {
                     return document.elementsFromPoint(x, y).slice(0, 10).map(el => {
                         const r = el.getBoundingClientRect();
@@ -945,7 +1087,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 loc = page.get_by_text(text, exact=True).first
                 results = []
                 for level in range(1, 8):
@@ -979,7 +1121,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.mouse.click(int(x), int(y))
                 await page.wait_for_timeout(1000)
                 msg = f"已点击坐标 ({x}, {y})\n当前标题：{_mask_sensitive(await page.title(), 300)}\n当前URL：{_mask_sensitive(page.url, 500)}"
@@ -992,19 +1134,28 @@ class BrowserOperatorPlugin(Star):
         '''查看当前焦点元素。不会刷新页面。密码框等敏感 value 会被隐藏。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 js_code = """() => {
+                    const sensitiveRe = /password|passwd|pwd|token|cookie|secret|api[_-]?key|authorization|auth|bearer|验证码|密码|令牌|密钥/i;
                     const el = document.activeElement;
                     if (!el) return null;
                     const r = el.getBoundingClientRect();
                     const type = el.getAttribute('type');
-                    const sensitive = type === 'password';
+                    const meta = [
+                        el.getAttribute('name'),
+                        el.id,
+                        el.getAttribute('placeholder'),
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('autocomplete')
+                    ].join(' ');
+                    const sensitive = type === 'password' || sensitiveRe.test(meta);
+                    const formLike = ['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName);
                     return {
                         tag: el.tagName,
                         id: el.id,
                         className: String(el.className || '').slice(0, 120),
                         type,
-                        value: sensitive ? '<masked>' : String(el.value || '').slice(0, 200),
+                        value: formLike ? (sensitive ? '<masked>' : '<not returned>') : '',
                         text: String(el.innerText || '').slice(0, 200),
                         placeholder: el.getAttribute("placeholder"),
                         role: el.getAttribute("role"),
@@ -1019,7 +1170,7 @@ class BrowserOperatorPlugin(Star):
 
     @filter.llm_tool(name="browser_download_click")
     async def browser_download_click(self, event: AstrMessageEvent, selector: str, filename: str = ""):
-        '''点击页面元素并等待下载。下载文件保存到 /opt/AstrBot/data/temp/。不会刷新页面，除非网站点击后自己跳转。
+        '''点击页面元素并等待下载。下载文件保存到配置的 temp_dir。不会刷新页面，除非网站点击后自己跳转。
 
         Args:
             selector(string): 下载按钮/链接的文本或 CSS 选择器
@@ -1027,36 +1178,41 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 async with page.expect_download(timeout=30000) as download_info:
                     await _click_like(page, selector)
                 download = await download_info.value
                 suggested = download.suggested_filename or f"download_{_now_stamp()}"
-                safe_name = Path(filename or suggested).name
-                save_path = TEMP_DIR / safe_name
+                safe_name = sanitize_filename(Path(filename or suggested).name)
+                save_path = self._temp_dir(event) / safe_name
                 await download.save_as(str(save_path))
+                max_bytes = self._runtime(event).max_download_size_mb * 1024 * 1024
+                if save_path.exists() and save_path.stat().st_size > max_bytes:
+                    save_path.unlink(missing_ok=True)
+                    return f"下载文件超过大小限制（{self._runtime(event).max_download_size_mb} MB），已删除。"
                 msg = f"下载完成：{save_path}"
                 return await self._with_observation(event, "download", msg, page)
             except Exception as e:
-                shot = await _browser_controller.error_screenshot(await _browser_controller.ensure_page(), "download_error")
+                shot = await self._safe_error_screenshot(event, "download_error")
                 return f"下载失败：{_mask_sensitive(str(e), 1000)}\n错误截图：{shot}"
 
     @filter.llm_tool(name="browser_upload")
     async def browser_upload(self, event: AstrMessageEvent, selector: str, file_path: str):
-        '''上传文件。只允许上传 /opt/AstrBot/data/temp/ 目录内的文件。不会刷新页面。
+        '''上传文件。只允许上传配置 temp_dir 目录内的文件。不会刷新页面。
 
         Args:
             selector(string): input[type=file] 的 CSS 选择器
-            file_path(string): 要上传的文件路径，必须位于 /opt/AstrBot/data/temp/
+            file_path(string): 要上传的文件路径，必须位于配置 temp_dir
         '''
         async with _browser_controller._op_lock:
             try:
-                path = Path(file_path)
+                path = Path(file_path).expanduser().resolve()
                 if not path.exists():
                     return f"错误：文件不存在：{path}"
-                if not _is_path_under(path, TEMP_DIR):
-                    return "错误：为避免误上传敏感文件，只允许上传 /opt/AstrBot/data/temp/ 目录内的文件"
-                page = await _browser_controller.ensure_page()
+                temp_dir = self._temp_dir(event).resolve()
+                if not _is_path_under(path, temp_dir):
+                    return f"错误：为避免误上传敏感文件，只允许上传 {temp_dir} 目录内的文件"
+                page = await self._ensure_page(event)
                 await page.locator(selector).first.set_input_files(str(path))
                 msg = f"已上传文件：{path.name}"
                 return await self._with_observation(event, "upload", msg, page)
@@ -1072,15 +1228,17 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 context = _browser_controller.context
+                if len(_browser_controller.pages()) >= self._runtime(event).max_pages:
+                    return f"错误：页面数量已达到上限 {self._runtime(event).max_pages}"
                 async with context.expect_page(timeout=30000) as page_info:
                     await _click_like(page, selector)
                 new_page = await page_info.value
-                await _browser_controller._prepare_page(new_page)
+                await _browser_controller._prepare_page(new_page, self._runtime(event))
                 await new_page.wait_for_load_state("domcontentloaded", timeout=30000)
                 await new_page.wait_for_timeout(1000)
-                _browser_controller.page = new_page
+                _browser_controller.set_page(new_page)
                 msg = f"已打开并切换到新页面\n标题：{_mask_sensitive(await new_page.title(), 300)}\nURL：{_mask_sensitive(new_page.url, 500)}"
                 return await self._with_observation(event, "new_page", msg, new_page)
             except Exception as e:
@@ -1091,8 +1249,8 @@ class BrowserOperatorPlugin(Star):
         '''列出当前浏览器中的所有页面/标签页。不会刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                await _browser_controller.ensure_page()
-                pages = [p for p in _browser_controller.context.pages if not p.is_closed()]
+                await self._ensure_page(event)
+                pages = _browser_controller.pages()
                 result = []
                 for i, p in enumerate(pages):
                     result.append({"index": i, "active": p == _browser_controller.page, "title": await p.title(), "url": p.url})
@@ -1109,12 +1267,12 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                await _browser_controller.ensure_page()
-                pages = [p for p in _browser_controller.context.pages if not p.is_closed()]
+                await self._ensure_page(event)
+                pages = _browser_controller.pages()
                 idx = int(index)
                 if idx < 0 or idx >= len(pages):
                     return f"错误：页面序号超出范围，当前共有 {len(pages)} 个页面"
-                _browser_controller.page = pages[idx]
+                _browser_controller.set_page(pages[idx])
                 msg = f"已切换到页面 {idx}\n标题：{_mask_sensitive(await pages[idx].title(), 300)}\nURL：{_mask_sensitive(pages[idx].url, 500)}"
                 return await self._with_observation(event, "switch_page", msg, pages[idx])
             except Exception as e:
@@ -1125,13 +1283,13 @@ class BrowserOperatorPlugin(Star):
         '''关闭当前标签页。如果只剩一个页面，则不关闭浏览器。不会刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
-                pages = [p for p in _browser_controller.context.pages if not p.is_closed()]
+                page = await self._ensure_page(event)
+                pages = _browser_controller.pages()
                 if len(pages) <= 1:
                     return "当前只有一个页面，未关闭；如需释放资源请调用 browser_close"
                 await page.close()
-                remaining = [p for p in _browser_controller.context.pages if not p.is_closed()]
-                _browser_controller.page = remaining[0] if remaining else None
+                remaining = _browser_controller.pages()
+                _browser_controller.set_page(remaining[0] if remaining else None)
                 msg = f"已关闭当前页面，剩余 {len(remaining)} 个页面"
                 if _browser_controller.page:
                     return await self._with_observation(event, "switch_page", msg, _browser_controller.page)
@@ -1150,7 +1308,7 @@ class BrowserOperatorPlugin(Star):
         max_chars = max(200, min(int(max_chars), 12000))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 text = await page.frame_locator(frame_selector).locator("body").inner_text(timeout=10000)
                 return _mask_sensitive(text, max_chars)
             except Exception as e:
@@ -1166,7 +1324,7 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 frame = page.frame_locator(frame_selector)
                 try:
                     await frame.get_by_text(selector, exact=True).click(timeout=5000)
@@ -1190,14 +1348,18 @@ class BrowserOperatorPlugin(Star):
         '''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 frame = page.frame_locator(frame_selector)
                 loc = frame.locator(selector).first
+                sensitive = await _locator_sensitive(loc)
                 if clear:
                     await loc.fill(text, timeout=5000)
                 else:
                     await loc.type(text, timeout=5000)
                 msg = f"iframe 内输入成功（长度 {len(text)}）"
+                if sensitive:
+                    self._mark_sensitive(event)
+                    return msg + "\n检测到敏感字段，已跳过截图和自动观察。"
                 return await self._with_observation(event, "frame_type", msg, page)
             except Exception as e:
                 return f"iframe 内输入失败：{_mask_sensitive(str(e), 800)}"
@@ -1226,7 +1388,7 @@ class BrowserOperatorPlugin(Star):
         height = max(240, min(int(height), 5000))
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 await page.set_viewport_size({"width": width, "height": height})
                 msg = f"视口已设置为 {width}x{height}"
                 return await self._with_observation(event, "viewport", msg, page)
@@ -1248,7 +1410,7 @@ class BrowserOperatorPlugin(Star):
         '''保存当前页面诊断报告，包括 title、URL、console、request failed、正文预览。不会刷新页面。'''
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 report = []
                 report.append(f"Title: {_mask_sensitive(await page.title(), 300)}")
                 report.append(f"URL: {_mask_sensitive(page.url, 500)}")
@@ -1265,9 +1427,14 @@ class BrowserOperatorPlugin(Star):
                     report.append(f"\nLast screenshot: {self.last_screenshot_path}")
                 if self.last_observation:
                     report.append("\nLast observation:\n" + self.last_observation[:2000])
-                path = TEMP_DIR / f"browser_diagnostic_{_now_stamp()}.txt"
+                runtime = self._runtime(event)
+                report.append(f"\nProfile key: {runtime.profile_key}")
+                report.append(f"Profile dir: {runtime.profile_dir}")
+                report.append(f"Private network allowed: {runtime.allow_private_network}")
+                report.append(f"Sensitive mode: {runtime.profile_key in self.sensitive_profiles}")
+                path = self._temp_dir(event) / f"browser_diagnostic_{_now_stamp()}.txt"
                 path.write_text("\n".join(report), encoding="utf-8")
-                shot = await _browser_controller.error_screenshot(page, "diagnostic")
+                shot = await _browser_controller.error_screenshot(page, "diagnostic", self._temp_dir(event))
                 return f"诊断报告已保存：{path}\n截图：{shot}"
             except Exception as e:
                 return f"诊断失败：{_mask_sensitive(str(e), 800)}"
@@ -1283,7 +1450,7 @@ class BrowserOperatorPlugin(Star):
             return "错误：此工具仅限管理员使用"
         async with _browser_controller._op_lock:
             try:
-                page = await _browser_controller.ensure_page()
+                page = await self._ensure_page(event)
                 result = await page.evaluate(js)
                 return "执行结果：\n" + _safe_json(result, 12000)
             except Exception as e:

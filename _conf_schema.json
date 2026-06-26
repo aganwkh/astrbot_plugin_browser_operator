@@ -1,11 +1,107 @@
 {
+  "data_dir": {
+    "description": "AstrBot 数据目录。为空时默认使用 /opt/AstrBot/data。",
+    "type": "string",
+    "default": "/opt/AstrBot/data"
+  },
+  "temp_dir": {
+    "description": "截图、下载和诊断文件保存目录。为空时使用 data_dir/temp。",
+    "type": "string",
+    "default": ""
+  },
+  "chrome_path": {
+    "description": "Chromium/Chrome 可执行文件路径。为空时使用 Playwright 默认浏览器。",
+    "type": "string",
+    "default": ""
+  },
+  "headless": {
+    "description": "是否启用无头模式。",
+    "type": "bool",
+    "default": true
+  },
+  "viewport_width": {
+    "description": "浏览器视口宽度。",
+    "type": "int",
+    "default": 1280
+  },
+  "viewport_height": {
+    "description": "浏览器视口高度。",
+    "type": "int",
+    "default": 800
+  },
+  "default_timeout_ms": {
+    "description": "默认 Playwright 操作超时时间，单位毫秒。",
+    "type": "int",
+    "default": 15000
+  },
+  "user_data_dir": {
+    "description": "浏览器持久化 profile 根目录。为空时使用 data_dir/browser_profiles。",
+    "type": "string",
+    "default": ""
+  },
+  "profile_scope": {
+    "description": "浏览器 profile 隔离方式：global/session/user/platform_session。默认 session，避免不同群或会话共用登录态。",
+    "type": "string",
+    "default": "session",
+    "hint": "可选 global/session/user/platform_session"
+  },
+  "allow_private_network": {
+    "description": "是否允许访问 localhost、内网、link-local 和云 metadata 地址。默认关闭。",
+    "type": "bool",
+    "default": false
+  },
+  "allowed_domains": {
+    "description": "域名白名单，逗号分隔或列表。非空时只允许访问这些域名及其子域名。",
+    "type": "list",
+    "default": []
+  },
+  "blocked_domains": {
+    "description": "域名黑名单，逗号分隔或列表。命中后拒绝访问。",
+    "type": "list",
+    "default": []
+  },
+  "allowed_users": {
+    "description": "允许使用浏览器工具的用户 ID 列表。空列表表示不限制。",
+    "type": "list",
+    "default": []
+  },
+  "allowed_sessions": {
+    "description": "允许使用浏览器工具的会话/群 ID 列表。空列表表示不限制。",
+    "type": "list",
+    "default": []
+  },
+  "use_proxy": {
+    "description": "是否为浏览器显式启用代理。默认关闭，不再自动探测 127.0.0.1:7890。",
+    "type": "bool",
+    "default": false
+  },
+  "proxy_server": {
+    "description": "代理地址，例如 http://127.0.0.1:7890。仅在 use_proxy=true 时生效。",
+    "type": "string",
+    "default": ""
+  },
+  "max_pages": {
+    "description": "最多允许打开的标签页数量。",
+    "type": "int",
+    "default": 5
+  },
+  "max_download_size_mb": {
+    "description": "下载文件最大大小，单位 MB。超过后自动删除。",
+    "type": "int",
+    "default": 50
+  },
+  "block_screenshots_in_sensitive_mode": {
+    "description": "敏感字段输入后是否阻止截图和视觉观察，直到打开新页面、刷新、后退或前进解除。",
+    "type": "bool",
+    "default": true
+  },
   "vision_wait_for_load": {
-    "description": "自动观察前是否等待页面加载完成。开启后会在关键操作后等待 domcontentloaded，确保页面内容已渲染。",
+    "description": "自动观察前是否等待页面加载完成。",
     "type": "bool",
     "default": true
   },
   "vision_wait_timeout": {
-    "description": "等待页面加载完成的超时秒数。过长会影响响应速度。",
+    "description": "等待页面加载完成的超时秒数。",
     "type": "float",
     "default": 5,
     "hint": "建议 3-10 秒"
@@ -16,7 +112,7 @@
     "default": true
   },
   "vision_provider": {
-    "description": "多模态模型提供商。请选择一个支持图片输入的 provider，例如 mimo-v2-omni、Qwen-VL、GPT-4o 等。留空则只截图，不调用视觉模型。",
+    "description": "多模态模型提供商。请选择一个支持图片输入的 provider。留空则只截图，不调用视觉模型。",
     "type": "string",
     "default": "",
     "_special": "select_provider"
@@ -27,12 +123,12 @@
     "default": true
   },
   "vision_trigger_actions": {
-    "description": "触发自动观察的操作，逗号分隔。可选：open,click,type,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,frame_type,viewport",
+    "description": "触发自动观察的操作，逗号分隔。默认不包含 type/frame_type，避免敏感输入泄露。",
     "type": "string",
-    "default": "open,click,type,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,frame_type,viewport"
+    "default": "open,click,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,viewport"
   },
   "vision_full_page": {
-    "description": "自动观察时是否整页截图。默认 false，只截当前视口，速度更快，视觉模型也更容易判断。",
+    "description": "自动观察时是否整页截图。默认 false，只截当前视口。",
     "type": "bool",
     "default": false
   },
@@ -42,7 +138,7 @@
     "default": true
   },
   "vision_min_interval_seconds": {
-    "description": "自动观察最小间隔秒数，防止连续操作时过度调用视觉模型。设为 0 表示不限制。",
+    "description": "自动观察最小间隔秒数，防止连续操作时过度调用视觉模型。",
     "type": "float",
     "default": 0.5
   },

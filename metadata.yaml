@@ -3,10 +3,13 @@ desc: |
   【浏览器操作工具集】提供持久化 Playwright 浏览器实例，page 对象自动保持，多步操作不会丢失 session，也不会每次操作都刷新页面。
 
   关键规则：
-  - 固定使用 /usr/bin/chromium-browser
-  - 固定使用 --no-sandbox
-  - 登录态 profile 固定在 /opt/AstrBot/data/browser_profiles/default
-  - 截图、下载、诊断文件固定在 /opt/AstrBot/data/temp
+  - Chromium 路径可配置；为空时使用 Playwright 默认浏览器
+  - 默认使用 --no-sandbox
+  - 登录态 profile 默认按 session 隔离，避免不同会话共用登录态
+  - 截图、下载、诊断文件默认保存到 data_dir/temp，也可配置 temp_dir
+  - 默认禁止访问 localhost、内网、link-local 和云 metadata 地址
+  - 默认不自动启用代理，需要 use_proxy/proxy_server 显式配置
+  - 敏感字段输入后会跳过截图和自动观察
   - click/type/scroll/text/screenshot 等操作不会自动刷新页面
   - 只有 browser_reload 会刷新页面，browser_open 会跳转到新 URL
   - 禁止模型绕过插件手写 Playwright / Chromium / Selenium 代码，最终回复会被熔断拦截
