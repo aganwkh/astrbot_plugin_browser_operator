@@ -1,0 +1,59 @@
+{
+  "vision_wait_for_load": {
+    "description": "自动观察前是否等待页面加载完成。开启后会在关键操作后等待 domcontentloaded，确保页面内容已渲染。",
+    "type": "bool",
+    "default": true
+  },
+  "vision_wait_timeout": {
+    "description": "等待页面加载完成的超时秒数。过长会影响响应速度。",
+    "type": "float",
+    "default": 5,
+    "hint": "建议 3-10 秒"
+  },
+  "vision_enabled": {
+    "description": "启用多模态观察：浏览器关键操作后自动截图，并调用下方选择的视觉模型分析页面状态。",
+    "type": "bool",
+    "default": true
+  },
+  "vision_provider": {
+    "description": "多模态模型提供商。请选择一个支持图片输入的 provider，例如 mimo-v2-omni、Qwen-VL、GPT-4o 等。留空则只截图，不调用视觉模型。",
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
+  },
+  "vision_auto_observe": {
+    "description": "关键浏览器操作后自动观察。关闭后仍可手动调用 browser_observe。",
+    "type": "bool",
+    "default": true
+  },
+  "vision_trigger_actions": {
+    "description": "触发自动观察的操作，逗号分隔。可选：open,click,type,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,frame_type,viewport",
+    "type": "string",
+    "default": "open,click,type,press,select,check,reload,back,forward,hover,scroll,scroll_to,click_at,download,upload,new_page,switch_page,frame_click,frame_type,viewport"
+  },
+  "vision_full_page": {
+    "description": "自动观察时是否整页截图。默认 false，只截当前视口，速度更快，视觉模型也更容易判断。",
+    "type": "bool",
+    "default": false
+  },
+  "vision_include_visible_text": {
+    "description": "视觉分析提示中是否附带当前页面可见文本预览。",
+    "type": "bool",
+    "default": true
+  },
+  "vision_min_interval_seconds": {
+    "description": "自动观察最小间隔秒数，防止连续操作时过度调用视觉模型。设为 0 表示不限制。",
+    "type": "float",
+    "default": 0.5
+  },
+  "vision_max_chars": {
+    "description": "视觉模型分析结果最大返回字符数。",
+    "type": "int",
+    "default": 1500
+  },
+  "vision_prompt": {
+    "description": "视觉分析提示词，用于指导多模态模型分析浏览器截图。",
+    "type": "text",
+    "default": "请分析这张网页截图。输出必须简短，包含：当前页面状态、是否完成刚才操作、可见按钮/输入框/报错/验证码/风控提示、下一步建议。"
+  }
+}

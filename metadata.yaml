@@ -1,0 +1,41 @@
+name: astrbot_plugin_browser_operator
+desc: |
+  【浏览器操作工具集】提供持久化 Playwright 浏览器实例，page 对象自动保持，多步操作不会丢失 session，也不会每次操作都刷新页面。
+
+  关键规则：
+  - 固定使用 /usr/bin/chromium-browser
+  - 固定使用 --no-sandbox
+  - 登录态 profile 固定在 /opt/AstrBot/data/browser_profiles/default
+  - 截图、下载、诊断文件固定在 /opt/AstrBot/data/temp
+  - click/type/scroll/text/screenshot 等操作不会自动刷新页面
+  - 只有 browser_reload 会刷新页面，browser_open 会跳转到新 URL
+  - 禁止模型绕过插件手写 Playwright / Chromium / Selenium 代码，最终回复会被熔断拦截
+
+  常用工具：
+  - browser_open: 打开网页
+  - browser_state: 查看当前页面标题、URL、正文预览和标签页状态
+  - browser_text: 读取网页正文
+  - browser_html: 读取页面 HTML
+  - browser_list_elements: 列出按钮、链接、输入框等可交互元素
+  - browser_click / browser_click_role / browser_click_at: 点击元素
+  - browser_type / browser_press / browser_select / browser_check: 输入和表单操作
+  - browser_screenshot: 截图
+  - browser_observe: 截图并调用可选多模态模型分析页面状态
+  - browser_last_observation: 查看上一次截图观察结果
+  - browser_scroll / browser_scroll_to: 滚动页面
+  - browser_download_click: 点击并下载文件
+  - browser_upload: 上传 /opt/AstrBot/data/temp 内的文件
+  - browser_click_open_new_page / browser_pages / browser_switch_page: 新标签页操作
+  - browser_frame_text / browser_click_in_frame / browser_type_in_frame: iframe 操作
+  - browser_dialog_mode: 设置 alert/confirm/prompt 处理方式
+  - browser_diagnostic: 保存诊断报告和截图
+  - browser_close: 关闭浏览器释放资源
+
+  多模态观察：
+  - 插件配置中可用 select_provider 自由选择 vision_provider
+  - 状态改变型操作后可自动截图并调用视觉模型分析
+  - 不会每轮注入提示词，不污染上下文
+
+  【重要】需要浏览器操作时，优先使用这些工具，不要自己写 Playwright 代码。
+version: 0.3.0
+author: 虾仁 & 爱音
