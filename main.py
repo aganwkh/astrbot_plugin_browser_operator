@@ -29,6 +29,7 @@ except Exception:
 # 默认路径仅作为配置缺省值；运行时可由 _conf_schema.json 覆盖。
 DATA_DIR = Path("/opt/AstrBot/data")
 TEMP_DIR = DATA_DIR / "temp"
+SESSION_COOKIES_FILENAME = ".astrbot_session_cookies.json"
 
 
 def _mask_sensitive(value: Any, limit: int = 4000) -> str:
@@ -83,7 +84,10 @@ class BrowserController:
                 launch_kwargs = dict(
                     user_data_dir=str(runtime.profile_dir),
                     headless=runtime.headless,
-                    args=["--no-sandbox"],
+                    # DeepSeek's login relies on a session cookie (ds_session_id).
+                    # Persist session cookies so a persistent profile remains logged
+                    # in when AstrBot restarts or the browser context is recreated.
+                    args=["--no-sandbox", "--persist-session-cookies"],
                     viewport={"width": runtime.viewport_width, "height": runtime.viewport_height},
                     accept_downloads=True,
                 )
@@ -93,6 +97,7 @@ class BrowserController:
                     launch_kwargs["proxy"] = {"server": runtime.proxy_server}
 
                 self.context = await self.playwright.chromium.launch_persistent_context(**launch_kwargs)
+                await self._restore_session_cookies(runtime.profile_dir)
                 self.context.on("page", lambda p: asyncio.create_task(self._prepare_page(p, runtime)))
                 self.active_profile_key = runtime.profile_key
                 self.active_profile_dir = runtime.profile_dir
@@ -158,6 +163,72 @@ class BrowserController:
     def set_page(self, page):
         self.page = page
 
+    @staticmethod
+    def _session_cookies_path(profile_dir: Optional[Path]) -> Optional[Path]:
+        if profile_dir is None:
+            return None
+        return profile_dir / SESSION_COOKIES_FILENAME
+
+    async def _restore_session_cookies(self, profile_dir: Path) -> None:
+        """Restore session cookies that Chromium does not persist across shutdown."""
+        path = self._session_cookies_path(profile_dir)
+        if path is None or not path.is_file():
+            return
+        try:
+            cookies = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(cookies, list) or not cookies:
+                return
+            restored = []
+            allowed_keys = {
+                "name",
+                "value",
+                "url",
+                "domain",
+                "path",
+                "httpOnly",
+                "secure",
+                "sameSite",
+            }
+            for cookie in cookies:
+                if not isinstance(cookie, dict) or not cookie.get("name"):
+                    continue
+                restored.append({key: value for key, value in cookie.items() if key in allowed_keys})
+            if restored:
+                await self.context.add_cookies(restored)
+        except Exception:
+            # A stale or browser-version-specific sidecar must not prevent startup.
+            pass
+
+    async def _save_session_cookies(self) -> None:
+        """Save session cookies before context shutdown for restart-safe login state."""
+        path = self._session_cookies_path(self.active_profile_dir)
+        if self.context is None or path is None:
+            return
+        try:
+            cookies = await self.context.cookies()
+            session_cookies = []
+            allowed_keys = {
+                "name",
+                "value",
+                "url",
+                "domain",
+                "path",
+                "httpOnly",
+                "secure",
+                "sameSite",
+            }
+            for cookie in cookies:
+                # Playwright reports session cookies with expires <= 0.
+                if float(cookie.get("expires", -1)) > 0:
+                    continue
+                session_cookies.append({key: value for key, value in cookie.items() if key in allowed_keys})
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(session_cookies, ensure_ascii=False, indent=2), encoding="utf-8")
+            path.chmod(0o600)
+        except Exception:
+            # Login persistence is best-effort and must not block browser shutdown.
+            pass
+
     async def error_screenshot(self, page, prefix: str = "browser_error", temp_dir: Optional[Path] = None) -> Optional[Path]:
         try:
             temp_dir = temp_dir or TEMP_DIR
@@ -170,6 +241,10 @@ class BrowserController:
 
     async def _close_context(self):
         if self.context:
+            try:
+                await self._save_session_cookies()
+            except Exception:
+                pass
             try:
                 await self.context.close()
             except Exception:
@@ -194,6 +269,30 @@ class BrowserController:
 
 
 _browser_controller = BrowserController()
+_browser_operator_instance: Optional["BrowserOperatorPlugin"] = None
+
+
+def _get_browser_operator_instance() -> "BrowserOperatorPlugin":
+    """Return the live plugin instance used by AstrBot's plugin loader."""
+    plugin = _browser_operator_instance
+    if plugin is None:
+        raise RuntimeError("browser_operator 插件实例尚未加载")
+    return plugin
+
+
+async def get_browser_page_for_event(event: AstrMessageEvent):
+    """Return the page after applying browser_operator's event runtime policy."""
+    return await _get_browser_operator_instance()._ensure_page(event)
+
+
+def get_browser_operation_lock() -> asyncio.Lock:
+    """Return the lock shared by every browser_operator operation."""
+    return _browser_controller._op_lock
+
+
+def get_browser_temp_dir_for_event(event: AstrMessageEvent) -> Path:
+    """Return the event-scoped temp directory selected by browser_operator."""
+    return _get_browser_operator_instance()._temp_dir(event)
 
 BROWSER_BYPASS_PATTERNS = [
     r"\bfrom\s+playwright\b",
@@ -290,6 +389,8 @@ async def _fill_like(page, selector: str, text: str, clear: bool = True) -> tupl
 class BrowserOperatorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
+        global _browser_operator_instance
+        _browser_operator_instance = self
         self.config = config or {}
         self.last_screenshot_path: Optional[str] = None
         self.last_observation: str = ""
@@ -1467,4 +1568,7 @@ class BrowserOperatorPlugin(Star):
 
     async def terminate(self):
         """插件卸载时关闭浏览器。"""
+        global _browser_operator_instance
         await _browser_controller.close()
+        if _browser_operator_instance is self:
+            _browser_operator_instance = None
